@@ -3,6 +3,8 @@
 Push-to-talk voice link for Raspberry Pi that records, uploads to **n8n**, plays spoken replies, and gives rich LED/audio feedback.  
 The first shipped use-case is **Psychological Protection Mode**—a compassionate capture/respond loop that helps you name feelings, spot distortions, and anchor boundaries—while the platform stays general-purpose for assistants and automations.
 
+![SafetyScribe banner](https://raw.githubusercontent.com/CodeMusic/SafetyScribe/main/safetyscribe.png)
+
 ---
 
 ## ✨ Features
