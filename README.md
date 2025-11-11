@@ -1,83 +1,97 @@
 # SafetyScribe
 
-Push-to-talk voice link for Raspberry Pi that records, uploads to **n8n**, plays spoken replies, and gives rich LED/audio feedback.  
-The first shipped use-case is **Psychological Protection Mode**—a compassionate capture/respond loop that helps you name feelings, spot distortions, and anchor boundaries—while the platform stays general-purpose for assistants and automations.
+*A one-button, push-to-talk witness & wellbeing companion for Raspberry Pi.*  
+It records difficult interactions, uploads securely to **n8n**, plays helpful replies, and gives clear LED/audio feedback.
+
+The first flagship mode is **Dignity & Accountability**: when anyone is spoken to in a demeaning or abusive way (e.g., condescension, baseless claims like \`"you’re forgetting"\`), SafetyScribe lets you **toggle recording**, then automatically produces a **timestamped email report** with transcript highlights so the organization can take corrective action and prevent future harm.  
+**Inspired by a real pharmacy encounter** — built to give everyday people **assistive superpowers** and **peace of mind** for themselves and their families.
 
 ![SafetyScribe banner](https://raw.githubusercontent.com/CodeMusic/SafetyScribe/main/safetyscribe.png)
 
 ---
 
-## ✨ Features
+## ✨ Core Features
 
-- Hold-to-talk **PTT** and **double-tap** to toggle hands-free recording (ALSA `arecord`, WAV @ 48 kHz stereo). 
-- Uploads the WAV to an **n8n Webhook** as `multipart/form-data`.
-- Reads JSON response; if it includes `audio_url` (or `audio`) the file is fetched and **played** with `aplay`.
-- **DotStar LED** animations (two LEDs) for state:
-  - orange breathe = connecting
-  - green solid = ready
-  - rainbow spin = recording
-  - white chatter = playback
-  - red pulse = error
-  - cyan blip = unknown instruction
-- **Auto-recovery**: errors are signaled (LED/tones) and the loop keeps trying.
-- **Structured logging** to file + stdout.
-- **Optional synth tones** (on by default): startup jingle, PTT engage/release chirps, response chime, graceful shutdown.
-
----
-
-## 🧘 Psychological Protection Mode (v1)
-
-A reference n8n flow can:
-- Transcribe the audio,
-- Run a gentle cognitive check (feelings, needs, boundaries, cognitive distortions),
-- Return a short validating reflection + next-step prompt,
-- Optionally return TTS audio and an LED pattern.
-
-*This is not therapy; it’s a self-support mirror. Escalate to professionals when needed.*
+- **Hold-to-Talk (PTT)** and **Double-Tap** for hands-free toggle  
+  (ALSA \`arecord\`, WAV @ 48 kHz **stereo** with WM8960).
+- **Uploads** to an **n8n Webhook** as multipart/form-data.
+- Reads JSON; if the response contains \`audio_url\` (or \`audio\`) it **plays** it via \`aplay\`.
+- **Two DotStar LEDs** for state:
+  - orange breathe = connecting  
+  - green solid    = ready  
+  - rainbow spin   = recording  
+  - white chatter  = playback  
+  - red pulse      = error  
+  - cyan blip      = unknown instruction
+- **Auto-recovery**: signals errors (LED/tones) and keeps trying; never gets stuck.
+- **Structured JSON logs** to stdout and a local log file.
+- **Optional synth tones** (on by default): startup jingle, engage/release chirps, response chime, graceful shutdown.
 
 ---
 
-## 🧩 Architecture
+## 🛡️ Dignity & Accountability (Flagship Mode)
+
+When toggled during a difficult interaction, SafetyScribe will:
+
+1. **Capture audio** (with clear LED indicator and optional chime).  
+2. **Upload** to your **n8n** flow.  
+3. **Transcribe** and **analyze** for patterns of disrespect:
+   - condescension (slow/over-explained phrasing),
+   - baseless memory accusations (\`"you’re forgetting"\` when untrue),
+   - interruptions, dominance ratio (who talks most), sentiment shifts,
+   - key quotes with **timestamps**.  
+4. **Generate an email report** with a respectful, factual tone:
+   - date/time, location, participants (if known),
+   - short incident summary,
+   - objective metrics (interruptions, dominance, negative language markers),
+   - **timestamped quotes** (with quick links to audio moments),
+   - attachments or links (full audio and trimmed clip),
+   - clear requested action (coaching, review, follow-up).  
+5. Optionally **send the report** to the organization’s official contacts and CC a trusted advocate.
+
+> This mode aims to **restore dignity through accountability**. It documents behavior so teams can coach, improve, and prevent recurrence.
+
+---
+
+## 🧩 Architecture Overview
 
     [Button GPIO17]  ──>  [ssos.py] ── arecord ─┐
-    [DotStar x2]     <──  state/anim            │  multipart/form-data
+    [DotStar x2]     <──  state/anim            │   multipart/form-data
     [WM8960 HAT]     ──>  ALSA (48k stereo)  ──┼────────>  [n8n Webhook]
-                                               │            │
-                                               │        route/transcribe/reflect
-                                               │            │
-                                               └──── <──────┴── JSON:
-                                                    { "audio_url"| "audio", "led", "sound"? }
-                                                            │
-                                              aplay   <─────┘
+                                               │
+                                               ├─ Transcribe (Whisper, etc.)
+                                               ├─ Analyze (respect metrics)
+                                               ├─ Generate report email
+                                               └─ Respond JSON { audio_url?, led? }
+    
+    aplay + LED animation  <───────────────────────────────────────────────────────
 
 ---
 
 ## 🔧 Hardware
 
-- Raspberry Pi (Zero/Zero W/3/4/5).  
-- Audio HAT: **WM8960** (stereo mics, HP/speaker out).  
-- **2× DotStar (APA102)** on SPI (SCK/MOSI).  
-- Momentary button on **GPIO17** (active-low).
+- Raspberry Pi (Zero/Zero W/3/4/5)  
+- **WM8960** audio HAT (dual mics + headphone/speaker out)  
+- **2× DotStar (APA102)** on SPI (SCK/MOSI)  
+- Momentary button on **GPIO17** (active-low)
 
 ---
 
-## 📦 Software prerequisites
+## 📦 Software Prereqs
 
     sudo apt-get update
     sudo apt-get install -y python3 python3-pip python3-dev \
       python3-libgpiod gpiod alsa-utils
-
-    # add user to device groups, then re-login
-    sudo usermod -aG audio,gpio,spi $USER
+    sudo usermod -aG audio,gpio,spi $USER   # re-login after
 
     # Python libs
     pip3 install --user adafruit-blinka adafruit-circuitpython-dotstar requests
 
-*Enable SPI via raspi-config → Interface Options → SPI → Enable.*
+Enable SPI via \`raspi-config → Interface Options → SPI → Enable\`.
 
 ---
 
-## 🎚️ ALSA setup (good defaults for WM8960)
+## 🎚️ Recommended ALSA Setup (WM8960)
 
     # Input routing & analog boost
     amixer -c 0 sset 'Left Input Boost Mixer LINPUT1' 2
@@ -99,7 +113,7 @@ A reference n8n flow can:
     amixer -c 0 sset 'ALC Decay' 3
     amixer -c 0 sset 'ALC Hold Time' 0
 
-    # Persist
+    # Persist mixer state
     sudo alsactl store
 
 Sanity checks:
@@ -107,15 +121,15 @@ Sanity checks:
     # Playback
     aplay -D plughw:0,0 /usr/share/sounds/alsa/Front_Center.wav
 
-    # Record & play back (3s, stereo @ 48k)
+    # Record & play (3s, stereo @ 48k)
     arecord -D plughw:0,0 -f S16_LE -r 48000 -c 2 -d 3 ~/recs/mic_test.wav
     aplay   -D plughw:0,0 ~/recs/mic_test.wav
 
 ---
 
-## 🚀 Run
+## 🚀 Run the Client
 
-Place the script at:
+Script location:
 
     ~/safetyscribeos/ssos.py
 
@@ -124,75 +138,93 @@ Run:
     cd ~/safetyscribeos
     DEBUG=1 python3 ssos.py
 
-You should see JSON logs like:
+You should see logs like:
 
     {"ts":"...","msg":"startup","audio_dev":"plughw:0,0","rate":48000,"ch":2,"fmt":"S16_LE","debug":true}
     {"ts":"...","msg":"network_ready","host":"n8n.codemusic.ca","port":443}
 
 **Controls**
 
-- **Hold** button ⇒ record; **release** ⇒ upload.  
-- **Double-tap** ⇒ toggle record on/off (hands-free).
+- **Hold** button: record; **release**: upload.  
+- **Double-tap**: toggle record on/off (hands-free).
 
 ---
 
-## 🌐 n8n workflow
+## 🌐 n8n Workflow (Dignity Report)
 
 **Webhook node**
-
 - Method: POST  
-- Path: `safetyscribe` (or your choice)  
-- *Field Name for Binary Data*: **audio** (matches client)  
-- Respond: *When Last Node Finishes* → *First Entry JSON*
+- Path: \`safetyscribe\`  
+- Options → **Field Name for Binary Data**: set to \`audio\` (or use the auto-detect trick below).
 
-**Binary key gotcha** (n8n versions differ): the incoming binary may be keyed as `audio`, `audio0`, or `audio00`. Use this expression to reference the first binary key:
-
-    {{ Object.keys($binary)[0] }}
-
-Example: **Read/Write Files from Disk** → *Input Binary Field*:
+**Binary key gotcha (n8n versions vary)**  
+Incoming binary may arrive as \`audio\`, \`audio0\`, or \`audio00\`. To auto-detect, reference:
 
     {{ Object.keys($binary)[0] }}
 
-File path example:
+Examples:
+- **Read/Write Files from Disk → Input Binary Field**: use \`{{ Object.keys($binary)[0] }}\`  
+- **File path**:  
+  \`/data/safetyscribe/{{ $binary[Object.keys($binary)[0]].fileName || ("recording_" + $now + ".wav") }}\`
 
-    /data/safetyscribe/{{ $binary[Object.keys($binary)[0]].fileName || ("recording_" + $now + ".wav") }}
+**Suggested flow**
+1. Webhook (receive WAV)  
+2. Ensure dir exists (\`mkdir -p /data/safetyscribe\`)  
+3. Write file to disk (keep the original filename if available)  
+4. Transcribe (Whisper local/API)  
+5. Analyze:
+   - **Respect Index** (0–100)
+   - **Dominance ratio** (agent:customer speaking time)
+   - **Interruptions** with timestamps
+   - **Negative language markers** (condescension, unfounded memory claims)
+   - **Tone trend** over time  
+6. Build **Incident Email** (see template below)  
+7. Optionally **Send Email** (SMTP) to organization; CC advocate  
+8. Respond to Webhook with JSON (e.g., \`{"led":"white"}\` and, if desired, \`{"audio_url":"…/reply.wav"}\`)
 
-**Minimal flow**
+**Email template (example)**
 
-1) Webhook (receives WAV)  
-2) (Optional) Write File to Disk  
-3) Transcribe (Whisper or service)  
-4) Reflect / label (LLM)  
-5) TTS (generate reply)  
-6) **Respond to Webhook** with JSON:
+    Subject: Dignity & Accountability Report ({{ $json.store.name }} · {{ $json.meta.dateTime }})
 
-    {
-      "led": "white",
-      "audio_url": "https://example.com/reply.wav"
-    }
+    Summary:
+      • Person impacted: {{ $json.person.name || "Customer" }}
+      • Location: {{ $json.store.name }} ({{ $json.store.address }})
+      • Date/Time: {{ $json.meta.dateTimeLocal }}
+      • Respect Index: {{ $json.metrics.respectIndex }}/100
+      • Key Concerns: {{ $json.metrics.concerns.join(", ") }}
 
-**Fields understood by the client**
+    Evidence Highlights:
+      {{#each $json.highlights as |h|}}
+        – [{{ h.ts }}] {{ h.quote }}
+      {{/each}}
 
-- `audio_url` **or** `audio`  
-- `led` / `led_pattern` / `pattern`  
-- *(future)* `sound` pattern object
+    Requested Action:
+      • Review the interaction and provide coaching/remediation.
+      • Reply with steps taken to prevent recurrence.
+
+    Attachments/Links:
+      • Full audio: {{ $json.links.audio }}
+      • Clip (highlights): {{ $json.links.clip }}
+
+    Notes:
+      This report documents behavior to protect customer dignity and improve service quality.
 
 ---
 
 ## ⚙️ Configuration (env)
 
-| Var              | Default                                          | Meaning                                   |
-|------------------|--------------------------------------------------|-------------------------------------------|
-| \`SS_AUDIO_DEV\` | \`plughw:0,0\`                                   | ALSA device for record/playback           |
-| \`SS_RATE\`      | \`48000\`                                        | Sample rate                               |
-| \`SS_CH\`        | \`2\`                                            | Channels (2 = stereo)                     |
-| \`SS_ENDPOINT\`  | \`https://n8n.codemusic.ca/webhook/safetyscribe\`| Webhook URL                               |
-| \`DEBUG\`        | \`0\`                                            | \`1\` → verbose logs                       |
-| \`SS_TONES\`     | \`1\`                                            | Enable synth tones (0 = off)              |
+| Var            | Default                                          | Meaning                                 |
+|----------------|--------------------------------------------------|-----------------------------------------|
+| \`SS_AUDIO_DEV\` | \`plughw:0,0\`                                   | ALSA device for record/playback         |
+| \`SS_RATE\`      | \`48000\`                                        | Sample rate                             |
+| \`SS_CH\`        | \`2\`                                            | Channels                                |
+| \`SS_ENDPOINT\`  | \`https://n8n.codemusic.ca/webhook/safetyscribe\`| Webhook URL                             |
+| \`DEBUG\`        | \`0\`                                            | \`1\` → verbose logs                      |
+| \`SS_TONES\`     | \`1\`                                            | Enable synth tones (0 = off)            |
 
 ---
 
-## 🖍️ LED patterns
+## 🖍️ LED Patterns
 
 | Pattern        | Meaning                     |
 |----------------|-----------------------------|
@@ -205,40 +237,24 @@ File path example:
 
 ---
 
-## 🔊 Synth tones (optional)
+## 🔊 Synth Tones (Optional)
 
-Enabled by \`SS_TONES=1\`. Short, 2–3-tone cues:
-
-- Startup jingle (on ready)  
-- PTT engage + release chirps  
-- Response received chime  
-- Graceful shutdown outro
-
----
-
-## ♻️ Reliability & recovery
-
-- Network check gate before ready (orange → green).  
-- Upload failures: red pulse, log line, loop continues.  
-- Playback failures: brief red blink sequence, continue loop.  
-- Any crash is logged; SIGINT/SIGTERM trigger cleanup (LEDs off, outro tone if enabled).
+Enabled by \`SS_TONES=1\`. Short 2–3-tone cues:
+- **Startup jingle** (device ready)  
+- **PTT engage/release** chirps  
+- **Response received** chime  
+- **Graceful shutdown** outro
 
 ---
 
 ## 🗒️ Logging
 
-- Structured JSON lines to \`~/safetyscribeos/ssos.log\` and stdout.  
-- Examples: \`startup\`, \`network_ready\`, \`ptt_start\`, \`arecord_start\`, \`upload_ok\`, \`server_response\`, \`playback_error\`, \`ready\`.
+- JSON lines to \`~/safetyscribeos/ssos.log\` and stdout:  
+  \`startup\`, \`network_ready\`, \`ptt_start\`, \`arecord_start\`, \`upload_ok\`, \`server_response\`, \`playback_error\`, \`ready\`, etc.
 
 ---
 
-## 🧰 Run on boot (systemd)
-
-Create:
-
-    /etc/systemd/system/safetyscribe.service
-
-Contents:
+## 🧰 Run on Boot (systemd)
 
     [Unit]
     Description=SafetyScribe Voice Link
@@ -264,32 +280,36 @@ Enable:
 
 ---
 
-## 🔐 Security & privacy
+## 🔐 Privacy, Consent, and Ethics
 
-- Audio is sent only to your configured webhook.  
-- Prefer HTTPS endpoints you control.  
-- If storing files, apply encryption and access controls.  
-- Logs may include filenames/URLs—treat as sensitive.
+- **Know your local laws**: some regions require **two-party consent** for audio recording.  
+- Prefer **visible indicators** (LEDs/tones) when recording is active.  
+- Secure storage and transport (HTTPS, access controls) are **mandatory** in health-adjacent contexts.  
+- The **goal is improvement and protection**, not humiliation; reports should remain factual and respectful.
 
 ---
 
 ## 🛠️ Troubleshooting
 
-- No audio in recordings: check \`arecord\` test and ALSA mixer levels above.  
-- n8n shows “no binary field”: use \`{{ Object.keys($binary)[0] }}\`.  
-- Quiet mic or ticks: reduce \`ADC PCM\`, keep analog boost moderate, enable High-Pass Filter.  
-- LEDs stuck orange: DNS/host reachability for \`WIFI_TEST_HOST\`.
+- **No audio**: verify \`arecord\` test and ALSA mixer levels.  
+- **n8n “no binary field”**: use \`{{ Object.keys($binary)[0] }}\` for cross-version compatibility.  
+- **Quiet mic / ticks**: reduce \`ADC PCM\`, enable High-Pass Filter, moderate analog boost.  
+- **LEDs stuck orange**: DNS / host reachability for your \`WIFI_TEST_HOST\`.
 
 ---
 
 ## 🗺️ Roadmap
 
-- Double Tap aforementioned functionality 
-- Per-LED patterns (stereo color cues).  
+- Per-LED patterns for dual-color cues (left/right).  
 - Server-driven \`sound\` pattern objects (procedural beeps/phrases).  
-- Local wake-word (optional, post-MVP).  
-- Caching & offline queue.  
-- Additional modalities (status display, haptics).
-
+- Local wake-word (optional).  
+- Offline queue & retries with backoff.  
+- On-device redaction and clip-maker for precise evidence snippets.  
+- Additional report channels (secure portal uploads, case IDs).
 
 ---
+
+## ❤️ Purpose
+
+SafetyScribe exists so people can be **heard, believed, and protected**.  
+When dignity is defended with clear evidence and calm accountability, organizations can coach, improve, and prevent harm from occurring again.
