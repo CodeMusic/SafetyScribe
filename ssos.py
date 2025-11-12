@@ -5,13 +5,16 @@ from datetime import datetime
 from pathlib import Path
 import argparse
 import requests
+from urllib.parse import urlparse
 
 # ---------- Args / Config ----------
 ap = argparse.ArgumentParser(description="SafetyScribe OS")
 ap.add_argument("--no-sfx", action="store_true", help="disable synthetic sounds")
 args = ap.parse_args()
 
-AUDIO_DEV      = os.environ.get("SS_AUDIO_DEV", "plughw:0,0")
+AUDIO_DEV_BASE = os.environ.get("SS_AUDIO_DEV")
+AUDIO_CAPTURE_DEV = os.environ.get("SS_AUDIO_CAPTURE_DEV", AUDIO_DEV_BASE or "plughw:0,0")
+AUDIO_PLAY_DEV = os.environ.get("SS_AUDIO_PLAY_DEV", AUDIO_DEV_BASE or "")
 SAMPLE_RATE    = int(os.environ.get("SS_RATE", "48000"))   # WM8960 likes 48k
 CHANNELS       = int(os.environ.get("SS_CH",   "2"))       # dual mics → stereo
 SAMPLE_FMT     = "S16_LE"
@@ -25,10 +28,26 @@ WIFI_TEST_PORT = int(os.environ.get("SS_NET_PORT", "443"))
 DEBUG          = os.environ.get("DEBUG", "0") == "1"
 LOG_PATH       = Path(os.path.expanduser("~/safetyscribeos/ssos.log"))
 SFX_ENABLED    = (os.environ.get("SS_SFX", "1") == "1") and (not args.no_sfx)
+HISTORY_LIMIT  = int(os.environ.get("SS_HISTORY_LIMIT", "50"))
+IDLE_DIM_SECS  = int(os.environ.get("SS_IDLE_DIM_SECS", str(5*60)))
+IDLE_OFF_THRESHOLD = float(os.environ.get("SS_IDLE_OFF_THRESHOLD", "0.2"))
+LED_SEQ_BRIGHTNESS_CAP = float(os.environ.get("SS_LED_SEQ_BRIGHTNESS", "0.45"))
+REQUEST_TIMEOUT = float(os.environ.get("SS_REQUEST_TIMEOUT", "300"))
 
 RECS_DIR.mkdir(parents=True, exist_ok=True)
+RESPONSES_DIR = RECS_DIR / "responses"
+RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 TMPDIR = Path("/dev/shm" if Path("/dev/shm").exists() else tempfile.gettempdir())
+
+def _normalize_device(value):
+    if value is None:
+        return None
+    val = str(value).strip()
+    return val or None
+
+AUDIO_PLAY_DEV = _normalize_device(AUDIO_PLAY_DEV)
+AUDIO_CAPTURE_DEV = _normalize_device(AUDIO_CAPTURE_DEV)
 
 # ---------- Logging ----------
 def log(msg, **kv):
@@ -42,12 +61,88 @@ def log(msg, **kv):
     except Exception:
         pass
 
+def enforce_dir_limit(dir_path, limit):
+    if limit <= 0:
+        return
+    try:
+        entries = [p for p in Path(dir_path).iterdir() if p.is_file()]
+    except Exception as e:
+        log("dir_scan_error", path=str(dir_path), err=str(e))
+        return
+    if len(entries) <= limit:
+        return
+    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in entries[limit:]:
+        try:
+            stale.unlink()
+            log("pruned_file", path=str(stale))
+        except Exception as e:
+            log("prune_failed", path=str(stale), err=str(e))
+
+def _slugify_hint(text, fallback="clip"):
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug or fallback
+
+def _next_audio_path(directory, prefix, hint="", ext=".wav"):
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+    suffix = ext if ext.startswith(".") else f".{ext}"
+    slug = _slugify_hint(hint, prefix)
+    return Path(directory) / f"{prefix}_{ts}_{slug}{suffix}"
+
+def write_audio_file(directory, prefix, raw, hint="clip", ext=".wav"):
+    path = _next_audio_path(directory, prefix, hint, ext)
+    with open(path, "wb") as f:
+        f.write(raw)
+    enforce_dir_limit(directory, HISTORY_LIMIT)
+    return path
+
 # ---------- LEDs ----------
 import gpiod
 import board
 import adafruit_dotstar as dotstar
 
 dots = dotstar.DotStar(board.SCK, board.MOSI, 2, brightness=LED_BRIGHTNESS, auto_write=True)
+
+_brightness_request = LED_BRIGHTNESS
+_idle_brightness_scale = 1.0
+_last_interaction_ts = time.monotonic()
+
+def _apply_brightness():
+    dots.brightness = max(0.0, min(1.0, _brightness_request * _idle_brightness_scale))
+
+def set_brightness_request(value):
+    global _brightness_request
+    try:
+        val = float(value)
+    except Exception:
+        val = LED_BRIGHTNESS
+    _brightness_request = max(0.0, min(val, 1.0))
+    _apply_brightness()
+
+def record_interaction():
+    global _last_interaction_ts, _idle_brightness_scale
+    _last_interaction_ts = time.monotonic()
+    if _idle_brightness_scale != 1.0:
+        _idle_brightness_scale = 1.0
+        _apply_brightness()
+
+def update_idle_dimming():
+    if IDLE_DIM_SECS <= 0:
+        return
+    elapsed = time.monotonic() - _last_interaction_ts
+    if elapsed < IDLE_DIM_SECS:
+        scale = 1.0
+    else:
+        steps = int(elapsed // IDLE_DIM_SECS)
+        scale = 0.5 ** steps
+        if scale < IDLE_OFF_THRESHOLD:
+            scale = 0.0
+    global _idle_brightness_scale
+    if abs(scale - _idle_brightness_scale) > 1e-4:
+        _idle_brightness_scale = scale
+        _apply_brightness()
+
+set_brightness_request(LED_BRIGHTNESS)
 
 def led(c0, c1=None):  # (r,g,b) for each LED
     if c1 is None: c1 = c0
@@ -75,17 +170,18 @@ def _stop_animation():
         try: _anim_thread.join(timeout=0.2)
         except Exception: pass
     leds_off()
+    set_brightness_request(LED_BRIGHTNESS)
 
 def anim_waiting_orange():
     def run():
         t = 0.0
         while not _anim_stop.is_set():
             b = 0.12 + 0.12*(0.5 + 0.5*math.sin(t))
-            dots.brightness = b
+            set_brightness_request(b)
             led((255,165,0))
             time.sleep(0.05)
             t += 0.18
-        dots.brightness = LED_BRIGHTNESS
+        set_brightness_request(LED_BRIGHTNESS)
     _animate(run)
 
 def hsv(h, s=1.0, v=1.0):
@@ -120,6 +216,83 @@ def anim_error_strobe():
         while not _anim_stop.is_set():
             led((255,0,30), (255,0,30)); time.sleep(0.08)
             leds_off(); time.sleep(0.08)
+    _animate(run)
+
+def _color_from_value(val, fallback=(0,0,0)):
+    if isinstance(val, (list, tuple)) and len(val) == 3:
+        try:
+            return tuple(max(0, min(255, int(c))) for c in val)
+        except Exception:
+            return fallback
+    if isinstance(val, dict):
+        try:
+            return (
+                max(0, min(255, int(val.get("r", val.get("red", 0))))),
+                max(0, min(255, int(val.get("g", val.get("green", 0))))),
+                max(0, min(255, int(val.get("b", val.get("blue", 0)))))
+            )
+        except Exception:
+            return fallback
+    return fallback
+
+def _normalize_led_sequence(sequence):
+    if not isinstance(sequence, (list, tuple)):
+        return []
+    steps = []
+    for idx, raw in enumerate(sequence):
+        if not isinstance(raw, dict):
+            continue
+        step_idx = raw.get("step")
+        try:
+            step_idx = int(step_idx)
+        except Exception:
+            step_idx = idx
+        duration = raw.get("duration", 0.15)
+        try:
+            duration = max(0.03, min(float(duration), 2.0))
+        except Exception:
+            duration = 0.15
+        brightness = raw.get("brightness")
+        try:
+            brightness_val = max(0.0, min(float(brightness), LED_SEQ_BRIGHTNESS_CAP))
+        except Exception:
+            brightness_val = None
+        led0 = _color_from_value(raw.get("led0") or raw.get("color") or raw.get("c0"), (200, 220, 255))
+        led1 = _color_from_value(raw.get("led1") or raw.get("c1"), led0)
+        steps.append({
+            "step": step_idx,
+            "duration": duration,
+            "brightness": brightness_val,
+            "led0": led0,
+            "led1": led1,
+        })
+    steps.sort(key=lambda x: x["step"])
+    return steps
+
+def anim_led_sequence(sequence):
+    steps = _normalize_led_sequence(sequence)
+    if not steps:
+        anim_talking()
+        return
+
+    def run():
+        idx = 0
+        while not _anim_stop.is_set():
+            step = steps[idx % len(steps)]
+            if step["brightness"] is not None:
+                set_brightness_request(step["brightness"])
+            else:
+                set_brightness_request(LED_BRIGHTNESS)
+            led(step["led0"], step["led1"])
+            end_time = time.time() + step["duration"]
+            while not _anim_stop.is_set():
+                remaining = end_time - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.05, remaining))
+            idx += 1
+        set_brightness_request(LED_BRIGHTNESS)
+
     _animate(run)
 
 def flash_ok():
@@ -224,8 +397,14 @@ def play_frames_seq(seq):
         frames += env_fade(tone_frames(fL, fR, d, v))
         frames += env_fade(tone_frames(0,0,0.010,0.0))  # tiny spacer
     synth_to_wav(frames, tmp)
-    subprocess.run(["aplay", "-D", AUDIO_DEV, str(tmp)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    cmd = ["aplay"]
+    if AUDIO_PLAY_DEV:
+        cmd += ["-D", AUDIO_PLAY_DEV]
+    cmd.append(str(tmp))
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE, text=True, check=False)
+    if proc.returncode != 0:
+        log("sfx_play_error", rc=proc.returncode, stderr=(proc.stderr.strip() if proc.stderr else None))
     try: tmp.unlink()
     except Exception: pass
 
@@ -267,11 +446,19 @@ def sfx_from_pattern(pat):
     """
     seq = []
     for x in pat:
+        if not isinstance(x, dict):
+            continue
+        if "frequency" in x or "freq" in x:
+            freq = float(x.get("frequency", x.get("freq", 900)))
+            dur = float(x.get("duration", x.get("dur", 0.08)))
+            vol = float(x.get("volume", x.get("vol", 0.3)))
+            seq.append((freq, freq, dur, min(vol, 0.45)))
+            continue
         fL = float(x.get("fL", x.get("f", 1000)))
         fR = float(x.get("fR", fL))
         d  = float(x.get("d",  x.get("dur", 0.08)))
         v  = float(x.get("v",  x.get("vol", 0.35)))
-        seq.append((fL, fR, d, v))
+        seq.append((fL, fR, d, min(v, 0.45)))
     play_frames_seq(seq)
 
 # ---------- Network gate ----------
@@ -295,7 +482,8 @@ def start_recording():
     global _rec_proc, _current_wav
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     _current_wav = str(RECS_DIR / f"rec_{ts}.wav")
-    cmd = ["arecord", "-D", AUDIO_DEV, "-f", SAMPLE_FMT, "-c", str(CHANNELS), "-r", str(SAMPLE_RATE), _current_wav]
+    dev_args = ["-D", AUDIO_CAPTURE_DEV] if AUDIO_CAPTURE_DEV else []
+    cmd = ["arecord", *dev_args, "-f", SAMPLE_FMT, "-c", str(CHANNELS), "-r", str(SAMPLE_RATE), _current_wav]
     log("arecord_start", cmd=cmd, path=_current_wav)
     try:
         _rec_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -324,47 +512,67 @@ def stop_recording():
         sfx_release()
         log("arecord_stop", rc=rc,
             stderr=(stderr.decode(errors="ignore") if 'stderr' in locals() else None))
+    enforce_dir_limit(RECS_DIR, HISTORY_LIMIT)
     return _current_wav
 
 # ---------- Playback helpers ----------
-def play_wav_file(path):
-    anim_talking()
-    subprocess.run(["aplay", "-D", AUDIO_DEV, str(path)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    _stop_animation()
+def _decode_audio_base64(data_url_or_b64):
+    m = re.match(r"^data:audio/[^;]+;base64,(.+)$", data_url_or_b64)
+    payload = m.group(1) if m else data_url_or_b64
+    payload = re.sub(r"\s+", "", payload)
+    return base64.b64decode(payload, validate=True)
 
-def play_audio_from_url(url):
+def play_wav_file(path, led_sequence=None):
+    if led_sequence:
+        anim_led_sequence(led_sequence)
+    else:
+        anim_talking()
+    cmd = ["aplay"]
+    if AUDIO_PLAY_DEV:
+        cmd += ["-D", AUDIO_PLAY_DEV]
+    cmd.append(str(path))
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE, text=True, check=False)
+    if proc.returncode != 0:
+        log("aplay_error", rc=proc.returncode, stderr=(proc.stderr.strip() if proc.stderr else None), path=str(path))
+    _stop_animation()
+    return True
+
+def play_audio_from_url(url, led_sequence=None):
     log("playback_fetch_start", url=url)
     try:
-        with requests.get(url, stream=True, timeout=60) as r:
+        with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
             r.raise_for_status()
-            tmp = TMPDIR / f"dl_{int(time.time()*1000)}.wav"
-            with open(tmp, "wb") as f:
+            name_hint = Path(urlparse(url).path).name or "remote"
+            ext = Path(name_hint).suffix or ".wav"
+            path = _next_audio_path(RESPONSES_DIR, "respurl", name_hint, ext)
+            with open(path, "wb") as f:
                 for ch in r.iter_content(8192):
-                    if ch: f.write(ch)
-        log("playback_local", path=str(tmp))
-        play_wav_file(tmp)
-        tmp.unlink(missing_ok=True)
+                    if ch:
+                        f.write(ch)
+        enforce_dir_limit(RESPONSES_DIR, HISTORY_LIMIT)
+        log("playback_local", path=str(path))
+        play_wav_file(path, led_sequence=led_sequence)
         log("playback_done")
+        return True
     except Exception as e:
         log("playback_error", err=str(e))
         anim_error_strobe(); time.sleep(0.8); _stop_animation()
+        return False
 
-def play_audio_from_base64(data_url_or_b64, filename_hint="resp.wav"):
-    # accept raw base64 or data:audio/wav;base64,....
-    m = re.match(r"^data:audio/[^;]+;base64,(.+)$", data_url_or_b64)
-    b64 = m.group(1) if m else data_url_or_b64
+def play_audio_from_base64(data_url_or_b64, filename_hint="resp.wav", prefix="resp", led_sequence=None):
     try:
-        raw = base64.b64decode(b64, validate=True)
-        tmp = TMPDIR / f"rx_{int(time.time()*1000)}_{filename_hint}"
-        with open(tmp, "wb") as f: f.write(raw)
-        log("playback_local", path=str(tmp))
-        play_wav_file(tmp)
-        tmp.unlink(missing_ok=True)
+        raw = _decode_audio_base64(data_url_or_b64)
+        ext = Path(filename_hint).suffix or ".wav"
+        path = write_audio_file(RESPONSES_DIR, prefix, raw, filename_hint, ext)
+        log("playback_local", path=str(path))
+        play_wav_file(path, led_sequence=led_sequence)
         log("playback_done")
+        return True
     except Exception as e:
         log("playback_b64_error", err=str(e))
         anim_error_strobe(); time.sleep(0.8); _stop_animation()
+        return False
 
 # ---------- Upload + server actions ----------
 def run_led_pattern(p):
@@ -395,7 +603,7 @@ def upload_and_act(wav_path):
         with open(wav_path, "rb") as f:
             files = {"audio": (os.path.basename(wav_path), f, "audio/wav")}
             meta  = {"filename": os.path.basename(wav_path), "device": "SafetyScribe-PiZeroW"}
-            r = requests.post(ENDPOINT, files=files, data=meta, timeout=90)
+            r = requests.post(ENDPOINT, files=files, data=meta, timeout=REQUEST_TIMEOUT)
             status = r.status_code
             r.raise_for_status()
             resp = r.json()
@@ -406,32 +614,57 @@ def upload_and_act(wav_path):
         led((0,255,0))  # recover to ready
         return
 
+    if isinstance(resp, list):
+        chosen = next((item for item in resp if isinstance(item, dict)), {})
+        log("response_list_payload", count=len(resp), used=bool(chosen))
+        resp = chosen
+    elif not isinstance(resp, dict):
+        log("response_unexpected_type", type=str(type(resp)))
+        resp = {}
+
     # Parse response
     pattern = (resp.get("led") or resp.get("led_pattern") or resp.get("pattern") or "")
+    led_sequence = resp.get("led_sequence")
+    speak_b64 = resp.get("speak")
+    speak_text = resp.get("speak_text") or resp.get("reply_text")
     audio_url = resp.get("audio_url")
     audio_field = resp.get("audio")
     sound_pat = resp.get("sound_pattern") or resp.get("sound")
 
     log("server_response",
-        have_audio=bool(audio_url or audio_field),
+        have_audio=bool(speak_b64 or audio_url or audio_field),
         have_sound=bool(sound_pat),
-        pattern=pattern)
+        led_steps=(len(led_sequence) if isinstance(led_sequence, (list, tuple)) else 0),
+        pattern=pattern,
+        speak_text_len=len(speak_text) if isinstance(speak_text, str) else 0)
 
-    if sound_pat:
-        try: sfx_from_pattern(sound_pat)
-        except Exception as e: log("sound_pattern_error", err=str(e))
-
-    if audio_url:
-        sfx_response()
-        play_audio_from_url(audio_url)
-    elif isinstance(audio_field, str) and (audio_field.startswith("http://") or audio_field.startswith("https://")):
-        sfx_response()
-        play_audio_from_url(audio_field)
+    audio_played = False
+    if isinstance(speak_b64, str) and speak_b64.strip():
+        hint = f"{_slugify_hint(speak_text, 'speak')}.wav" if speak_text else "speak.wav"
+        audio_played = play_audio_from_base64(speak_b64, hint, prefix="speak", led_sequence=led_sequence)
+    elif isinstance(audio_url, str) and audio_url:
+        audio_played = play_audio_from_url(audio_url, led_sequence=led_sequence)
     elif isinstance(audio_field, str):
-        sfx_response()
-        play_audio_from_base64(audio_field, "payload.wav")
+        if audio_field.startswith("http://") or audio_field.startswith("https://"):
+            audio_played = play_audio_from_url(audio_field, led_sequence=led_sequence)
+        else:
+            audio_played = play_audio_from_base64(audio_field, "payload.wav", prefix="payload", led_sequence=led_sequence)
 
-    if pattern:
+    if audio_played:
+        if sound_pat:
+            try:
+                sfx_from_pattern(sound_pat)
+            except Exception as e:
+                log("sound_pattern_error", err=str(e))
+        elif SFX_ENABLED:
+            sfx_response()
+    elif sound_pat:
+        try:
+            sfx_from_pattern(sound_pat)
+        except Exception as e:
+            log("sound_pattern_error", err=str(e))
+
+    if pattern and not led_sequence:
         run_led_pattern(pattern)
 
     led((0,255,0))  # back to ready
@@ -439,7 +672,9 @@ def upload_and_act(wav_path):
 
 # ---------- Main loop (PTT + double-tap) ----------
 def main():
-    log("startup", audio_dev=AUDIO_DEV, rate=SAMPLE_RATE, ch=CHANNELS, fmt=SAMPLE_FMT, debug=DEBUG, sfx=SFX_ENABLED)
+    log("startup", audio_dev=AUDIO_DEV_BASE, capture_dev=AUDIO_CAPTURE_DEV,
+        play_dev=AUDIO_PLAY_DEV, rate=SAMPLE_RATE, ch=CHANNELS,
+        fmt=SAMPLE_FMT, debug=DEBUG, sfx=SFX_ENABLED)
     configure_audio_mixer()
     if SFX_ENABLED: sfx_startup_jingle()
     wait_for_wifi()
@@ -449,10 +684,15 @@ def main():
     recording = False
     ptt_mode_active = False
     now_ms = lambda: int(time.time()*1000)
+    prev_pressed = False
 
     while True:
+        pressed = False
         try:
+            update_idle_dimming()
             pressed = button_pressed()
+            if pressed and not prev_pressed:
+                record_interaction()
 
             # Push-to-talk
             if pressed and not ptt_mode_active and not recording:
@@ -490,11 +730,14 @@ def main():
                 else:
                     time.sleep(0.03)
 
+            prev_pressed = pressed
+
         except Exception as e:
             # Never die: signal via LEDs, then recover
             log("loop_error", err=str(e))
             anim_error_strobe(); time.sleep(0.8); _stop_animation()
             led((0,255,0))
+            prev_pressed = False
 
 def _cleanup(*_):
     try:
