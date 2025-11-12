@@ -158,7 +158,7 @@ You should see logs like:
 - Options → **Field Name for Binary Data**: set to \`audio\` (or use the auto-detect trick below).
 
 **Binary key gotcha (n8n versions vary)**  
-Incoming binary may arrive as \`audio\`, \`audio0\`, or \`audio00\`. To auto-detect, reference:
+Incoming binary arrives as \`audio\`. But, you can also auto-detect, reference:
 
     {{ Object.keys($binary)[0] }}
 
